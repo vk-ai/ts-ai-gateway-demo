@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ts-ai-gateway-demo</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #0f172a; background: #f8fafc; }
+    body { max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.35rem; margin-bottom: 0.25rem; }
+    .banner { background: #fef3c7; border: 1px solid #f59e0b; padding: 0.75rem 1rem; border-radius: 8px; margin: 1rem 0; font-size: 0.9rem; }
+    textarea { width: 100%; min-height: 88px; padding: 0.75rem; border-radius: 8px; border: 1px solid #cbd5e1; box-sizing: border-box; }
+    button { margin-top: 0.75rem; padding: 0.55rem 1rem; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; }
+    .meta { color: #64748b; font-size: 0.85rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>ts-ai-gateway-demo</h1>
+  <p class="meta">Minimal UI → <code>POST /chat</code>. Default provider is offline <strong>mock</strong>.</p>
+  <div class="banner">
+    <strong>OSS / learning portfolio demo only.</strong>
+    Not employer production software. Does not claim any employer production experience.
+  </div>
+  <label for="q">Question</label>
+  <textarea id="q" placeholder="e.g. How long does standard shipping take?">How long does standard ground shipping take?</textarea>
+  <button id="go" type="button">Ask</button>
+  <h2>Response</h2>
+  <pre id="out">{}</pre>
+  <script>
+    const out = document.getElementById('out');
+    const btn = document.getElementById('go');
+    const q = document.getElementById('q');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      out.textContent = 'Loading…';
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: q.value }),
+        });
+        const data = await res.json();
+        out.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        out.textContent = String(err);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
