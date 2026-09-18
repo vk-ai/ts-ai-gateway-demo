@@ -87,7 +87,7 @@ src/
   index.ts            HTTP server + static UI
 public/index.html     optional tiny client
 tests/                vitest groundedness / retrieval / provider
-ci/github-actions.yml CI mirror (copy to .github/workflows if allowed)
+ci/github-actions.yml (mirrored to `.github/workflows/ci.yml` for Actions) CI mirror (copy to .github/workflows if allowed)
 ```
 
 ## Tests & CI
