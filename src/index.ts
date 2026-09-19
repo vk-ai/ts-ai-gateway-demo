@@ -1,10 +1,11 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { handleChat } from './chat.js';
-import { createProvider, resolveProviderKind } from './providers/index.js';
-import { loadCorpus } from './rag/corpus.js';
+import { handleChat, handleChatStream } from './chat.js';
+import { createProvider, resolveProviderKind, type LlmProvider } from './providers/index.js';
+import { loadCorpus, type CorpusChunk } from './rag/corpus.js';
+import { formatSseEvent } from './sse.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const TOP_K = Number(process.env.RAG_TOP_K ?? 3);
@@ -39,19 +40,29 @@ function sendText(res: ServerResponse, status: number, body: string, type: strin
   res.end(body);
 }
 
-async function main(): Promise<void> {
-  const kind = resolveProviderKind();
-  const provider = createProvider(kind);
-  const corpus = await loadCorpus();
+function writeSseHeaders(res: ServerResponse): void {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  });
+}
 
-  console.log(
-    `[ts-ai-gateway-demo] provider=${provider.name} corpusChunks=${corpus.length} port=${PORT}`,
-  );
-  console.log(
-    'OSS/learning portfolio demo — NOT employer production. Offline mock is the default.',
-  );
+export interface GatewayDeps {
+  provider: LlmProvider;
+  corpus: CorpusChunk[];
+  topK?: number;
+  publicDir?: string;
+}
 
-  const server = createServer(async (req, res) => {
+export function createGatewayServer(deps: GatewayDeps): Server {
+  const topKDefault = deps.topK ?? TOP_K;
+  const publicDir = deps.publicDir ?? PUBLIC_DIR;
+
+  return createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
     if (req.method === 'OPTIONS') {
@@ -68,9 +79,10 @@ async function main(): Promise<void> {
       if (req.method === 'GET' && url.pathname === '/health') {
         sendJson(res, 200, {
           ok: true,
-          provider: provider.name,
-          chunks: corpus.length,
+          provider: deps.provider.name,
+          chunks: deps.corpus.length,
           demo: 'oss-learning-only',
+          routes: ['GET /', 'GET /health', 'POST /chat', 'POST /query', 'POST /chat/stream'],
         });
         return;
       }
@@ -89,34 +101,103 @@ async function main(): Promise<void> {
           sendJson(res, 400, { error: 'Provide "message" or "query" string' });
           return;
         }
-        const result = await handleChat(provider, corpus, {
+        const result = await handleChat(deps.provider, deps.corpus, {
           message,
-          topK: parsed.topK ?? TOP_K,
+          topK: parsed.topK ?? topKDefault,
         });
         sendJson(res, 200, result);
         return;
       }
 
+      if (req.method === 'POST' && url.pathname === '/chat/stream') {
+        const raw = await readBody(req);
+        let parsed: { message?: string; query?: string; topK?: number };
+        try {
+          parsed = JSON.parse(raw || '{}') as typeof parsed;
+        } catch {
+          sendJson(res, 400, { error: 'Invalid JSON body' });
+          return;
+        }
+        const message = parsed.message ?? parsed.query;
+        if (!message || typeof message !== 'string') {
+          sendJson(res, 400, { error: 'Provide "message" or "query" string' });
+          return;
+        }
+
+        writeSseHeaders(res);
+        // Comment frame helps some proxies flush headers immediately.
+        res.write(': connected\n\n');
+
+        try {
+          for await (const evt of handleChatStream(deps.provider, deps.corpus, {
+            message,
+            topK: parsed.topK ?? topKDefault,
+          })) {
+            res.write(
+              formatSseEvent({
+                event: evt.type,
+                data: JSON.stringify(evt),
+              }),
+            );
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          res.write(
+            formatSseEvent({
+              event: 'error',
+              data: JSON.stringify({ type: 'error', error: msg }),
+            }),
+          );
+        }
+        res.end();
+        return;
+      }
+
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-        const html = await readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+        const html = await readFile(path.join(publicDir, 'index.html'), 'utf8');
         sendText(res, 200, html, 'text/html; charset=utf-8');
         return;
       }
 
-      sendJson(res, 404, { error: 'Not found', routes: ['GET /', 'GET /health', 'POST /chat', 'POST /query'] });
+      sendJson(res, 404, {
+        error: 'Not found',
+        routes: ['GET /', 'GET /health', 'POST /chat', 'POST /query', 'POST /chat/stream'],
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(err);
-      sendJson(res, 500, { error: message });
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: message });
+      } else {
+        res.end();
+      }
     }
   });
+}
 
+async function main(): Promise<void> {
+  const kind = resolveProviderKind();
+  const provider = createProvider(kind);
+  const corpus = await loadCorpus();
+
+  console.log(
+    `[ts-ai-gateway-demo] provider=${provider.name} corpusChunks=${corpus.length} port=${PORT}`,
+  );
+  console.log(
+    'OSS/learning portfolio demo — NOT employer production. Offline mock is the default.',
+  );
+
+  const server = createGatewayServer({ provider, corpus, topK: TOP_K });
   server.listen(PORT, () => {
     console.log(`Listening on http://localhost:${PORT}`);
   });
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

@@ -7,7 +7,7 @@ Small TypeScript/Node AI gateway that wires together:
 
 1. An **LLM provider interface** — default **`mock`** (offline, deterministic); optional **OpenAI** when `OPENAI_API_KEY` is set  
 2. **Simple RAG** — bag-of-words + cosine similarity over a fixture markdown/txt corpus under `data/` (no vector DB)  
-3. A **minimal HTTP API** (`node:http`) — `POST /chat` and `POST /query` return answer + retrieved context + groundedness metric  
+3. A **minimal HTTP API** (`node:http`) — `POST /chat` / `POST /query` (JSON) plus **`POST /chat/stream` (SSE)** return answer + retrieved context + groundedness metric  
 4. **Offline eval tests** — groundedness / keyword overlap with Vitest (pass without any API keys)  
 5. A tiny static HTML page to hit the API  
 
@@ -25,6 +25,11 @@ Open http://localhost:3000 for the mini UI, or:
 curl -s http://localhost:3000/health
 
 curl -s -X POST http://localhost:3000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"How long does standard ground shipping take?"}'
+
+# SSE stream (framing demo)
+curl -sN -X POST http://localhost:3000/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{"message":"How long does standard ground shipping take?"}'
 ```
@@ -71,6 +76,23 @@ Response shape:
   "metrics": { "groundedness": 0.71, "retrievedCount": 3 }
 }
 ```
+
+### `POST /chat/stream` (SSE)
+
+Same JSON body as `/chat`. Responds with `text/event-stream` frames:
+
+```text
+event: meta
+data: {"type":"meta","provider":"mock","model":"mock-v1","retrievedCount":3}
+
+event: token
+data: {"type":"token","text":"Based on "}
+
+event: done
+data: {"type":"done","answer":"…","metrics":{…},…}
+```
+
+Teaching note: the mock (and optional OpenAI) path still **completes first**, then chunks the answer for SSE framing practice — this is **not** true token-by-token provider streaming. Existing `POST /chat` is unchanged.
 
 ### `GET /health`
 
