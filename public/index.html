@@ -10,28 +10,39 @@
     h1 { font-size: 1.35rem; margin-bottom: 0.25rem; }
     .banner { background: #fef3c7; border: 1px solid #f59e0b; padding: 0.75rem 1rem; border-radius: 8px; margin: 1rem 0; font-size: 0.9rem; }
     textarea { width: 100%; min-height: 88px; padding: 0.75rem; border-radius: 8px; border: 1px solid #cbd5e1; box-sizing: border-box; }
-    button { margin-top: 0.75rem; padding: 0.55rem 1rem; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; font-weight: 600; }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.75rem; }
+    button { padding: 0.55rem 1rem; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; font-weight: 600; }
+    button.secondary { background: #0f766e; }
     button:disabled { opacity: 0.6; cursor: wait; }
-    pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; white-space: pre-wrap; }
     .meta { color: #64748b; font-size: 0.85rem; margin-bottom: 1rem; }
+    #streamLive { min-height: 3rem; border: 1px dashed #94a3b8; border-radius: 8px; padding: 0.75rem; background: white; margin-bottom: 0.75rem; }
   </style>
 </head>
 <body>
   <h1>ts-ai-gateway-demo</h1>
-  <p class="meta">Minimal UI → <code>POST /chat</code>. Default provider is offline <strong>mock</strong>.</p>
+  <p class="meta">Minimal UI → <code>POST /chat</code> or streaming <code>POST /chat/stream</code> (SSE). Default provider is offline <strong>mock</strong>.</p>
   <div class="banner">
     <strong>OSS / learning portfolio demo only.</strong>
     Not employer production software. Does not claim any employer production experience.
   </div>
   <label for="q">Question</label>
   <textarea id="q" placeholder="e.g. How long does standard shipping take?">How long does standard ground shipping take?</textarea>
-  <button id="go" type="button">Ask</button>
+  <div class="row">
+    <button id="go" type="button">Ask (JSON)</button>
+    <button id="goStream" class="secondary" type="button">Ask (SSE stream)</button>
+  </div>
+  <h2>Stream live</h2>
+  <div id="streamLive">(idle)</div>
   <h2>Response</h2>
   <pre id="out">{}</pre>
   <script>
     const out = document.getElementById('out');
+    const live = document.getElementById('streamLive');
     const btn = document.getElementById('go');
+    const btnStream = document.getElementById('goStream');
     const q = document.getElementById('q');
+
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       out.textContent = 'Loading…';
@@ -47,6 +58,59 @@
         out.textContent = String(err);
       } finally {
         btn.disabled = false;
+      }
+    });
+
+    /** Tiny fetch-based SSE consumer (POST bodies aren't supported by EventSource). */
+    async function consumeSse(url, body, onEvent) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok || !res.body) throw new Error('stream HTTP ' + res.status);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const block of parts) {
+          const lines = block.split('\n');
+          let event = 'message';
+          const dataLines = [];
+          for (const line of lines) {
+            if (line.startsWith('event:')) event = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+          }
+          if (dataLines.length) onEvent(event, dataLines.join('\n'));
+        }
+      }
+    }
+
+    btnStream.addEventListener('click', async () => {
+      btnStream.disabled = true;
+      live.textContent = '';
+      out.textContent = 'Streaming…';
+      const events = [];
+      try {
+        await consumeSse('/chat/stream', { message: q.value }, (event, data) => {
+          events.push({ event, data });
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === 'token' && parsed.text) {
+              live.textContent += parsed.text;
+            }
+          } catch (_) { /* ignore non-JSON comment frames */ }
+        });
+        out.textContent = JSON.stringify(events, null, 2);
+      } catch (err) {
+        out.textContent = String(err);
+      } finally {
+        btnStream.disabled = false;
       }
     });
   </script>

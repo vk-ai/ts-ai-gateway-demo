@@ -5,6 +5,7 @@ import {
   retrieve,
   type RetrievedChunk,
 } from './rag/retrieve.js';
+import { chunkText } from './sse.js';
 
 export interface ChatRequest {
   message: string;
@@ -22,12 +23,39 @@ export interface ChatResponse {
   };
 }
 
+export type ChatStreamEvent =
+  | { type: 'meta'; provider: string; model: string; retrievedCount: number }
+  | { type: 'token'; text: string }
+  | {
+      type: 'done';
+      answer: string;
+      retrieved: RetrievedChunk[];
+      provider: string;
+      model: string;
+      metrics: { groundedness: number; retrievedCount: number };
+    };
+
 const SYSTEM_PREAMBLE =
   'You are a helpful support assistant. Answer ONLY using the retrieved context below. ' +
   'If the context is insufficient, say so clearly. Do not invent policies.\n\n' +
   'Retrieved context:';
 
 export async function handleChat(
+  provider: LlmProvider,
+  corpus: CorpusChunk[],
+  request: ChatRequest,
+): Promise<ChatResponse> {
+  const built = await buildChat(provider, corpus, request);
+  return {
+    answer: built.answer,
+    retrieved: built.retrieved,
+    provider: built.provider,
+    model: built.model,
+    metrics: built.metrics,
+  };
+}
+
+async function buildChat(
   provider: LlmProvider,
   corpus: CorpusChunk[],
   request: ChatRequest,
@@ -61,5 +89,36 @@ export async function handleChat(
       groundedness,
       retrievedCount: retrieved.length,
     },
+  };
+}
+
+/**
+ * Async generator that yields SSE-friendly chat events:
+ * meta → token* → done. Uses the same retrieve→complete path as /chat,
+ * then chunks the finished answer (mock/OpenAI both complete first — teaching demo).
+ */
+export async function* handleChatStream(
+  provider: LlmProvider,
+  corpus: CorpusChunk[],
+  request: ChatRequest,
+  opts?: { chunkSize?: number },
+): AsyncGenerator<ChatStreamEvent> {
+  const built = await buildChat(provider, corpus, request);
+  yield {
+    type: 'meta',
+    provider: built.provider,
+    model: built.model,
+    retrievedCount: built.metrics.retrievedCount,
+  };
+  for (const text of chunkText(built.answer, opts?.chunkSize ?? 12)) {
+    yield { type: 'token', text };
+  }
+  yield {
+    type: 'done',
+    answer: built.answer,
+    retrieved: built.retrieved,
+    provider: built.provider,
+    model: built.model,
+    metrics: built.metrics,
   };
 }
