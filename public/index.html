@@ -17,11 +17,25 @@
     pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; white-space: pre-wrap; }
     .meta { color: #64748b; font-size: 0.85rem; margin-bottom: 1rem; }
     #streamLive { min-height: 3rem; border: 1px dashed #94a3b8; border-radius: 8px; padding: 0.75rem; background: white; margin-bottom: 0.75rem; }
+    #citations { display: grid; gap: 0.5rem; margin: 0.75rem 0 1rem; }
+    .cite-card {
+      border: 1px solid #cbd5e1; border-radius: 8px; padding: 0.65rem 0.85rem;
+      background: #fff; font-size: 0.85rem;
+    }
+    .cite-card header { display: flex; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.35rem; }
+    .cite-card .badge {
+      display: inline-block; background: #dbeafe; color: #1e40af;
+      font-weight: 700; border-radius: 999px; padding: 0.1rem 0.55rem; font-size: 0.75rem;
+    }
+    .cite-card .score { color: #64748b; font-variant-numeric: tabular-nums; }
+    .cite-card .src { font-weight: 600; color: #334155; }
+    .cite-card .snippet { color: #475569; white-space: pre-wrap; max-height: 4.5rem; overflow: hidden; }
+    .cite-empty { color: #94a3b8; font-size: 0.85rem; }
   </style>
 </head>
 <body>
   <h1>ts-ai-gateway-demo</h1>
-  <p class="meta">Minimal UI → <code>POST /chat</code> or streaming <code>POST /chat/stream</code> (SSE). Default provider is offline <strong>mock</strong>.</p>
+  <p class="meta">Minimal UI → <code>POST /chat</code> or streaming <code>POST /chat/stream</code> (SSE). Default provider is offline <strong>mock</strong>. Citations arrive as an early SSE event before tokens.</p>
   <div class="banner">
     <strong>OSS / learning portfolio demo only.</strong>
     Not employer production software. Does not claim any employer production experience.
@@ -32,6 +46,8 @@
     <button id="go" type="button">Ask (JSON)</button>
     <button id="goStream" class="secondary" type="button">Ask (SSE stream)</button>
   </div>
+  <h2>Citations</h2>
+  <div id="citations" class="cite-empty">(none yet — run SSE stream)</div>
   <h2>Stream live</h2>
   <div id="streamLive">(idle)</div>
   <h2>Response</h2>
@@ -39,13 +55,47 @@
   <script>
     const out = document.getElementById('out');
     const live = document.getElementById('streamLive');
+    const citesEl = document.getElementById('citations');
     const btn = document.getElementById('go');
     const btnStream = document.getElementById('goStream');
     const q = document.getElementById('q');
 
+    function renderCitationCards(citations) {
+      if (!citations || !citations.length) {
+        citesEl.className = 'cite-empty';
+        citesEl.textContent = '(no citations in this response)';
+        return;
+      }
+      citesEl.className = '';
+      citesEl.innerHTML = '';
+      for (const c of citations) {
+        const card = document.createElement('article');
+        card.className = 'cite-card';
+        const snippet = (c.text || '').slice(0, 220) + ((c.text || '').length > 220 ? '…' : '');
+        card.innerHTML =
+          '<header>' +
+            '<span><span class="badge">[' + c.index + ']</span> <span class="src">' +
+              escapeHtml(c.source || c.id) + '</span></span>' +
+            '<span class="score">score ' + Number(c.score).toFixed(3) + '</span>' +
+          '</header>' +
+          '<div class="snippet">' + escapeHtml(snippet) + '</div>';
+        citesEl.appendChild(card);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       out.textContent = 'Loading…';
+      citesEl.className = 'cite-empty';
+      citesEl.textContent = '(JSON path — use SSE for citation cards)';
       try {
         const res = await fetch('/chat', {
           method: 'POST',
@@ -54,6 +104,17 @@
         });
         const data = await res.json();
         out.textContent = JSON.stringify(data, null, 2);
+        if (data.retrieved) {
+          renderCitationCards(
+            data.retrieved.map((r, i) => ({
+              index: i + 1,
+              id: r.id,
+              source: r.source,
+              text: r.text,
+              score: r.score,
+            })),
+          );
+        }
       } catch (err) {
         out.textContent = String(err);
       } finally {
@@ -94,6 +155,8 @@
     btnStream.addEventListener('click', async () => {
       btnStream.disabled = true;
       live.textContent = '';
+      citesEl.className = 'cite-empty';
+      citesEl.textContent = 'Waiting for citations event…';
       out.textContent = 'Streaming…';
       const events = [];
       try {
@@ -101,6 +164,10 @@
           events.push({ event, data });
           try {
             const parsed = JSON.parse(data);
+            if (parsed.type === 'citations' && Array.isArray(parsed.citations)) {
+              // Citations-first: render cards as soon as the early SSE event arrives.
+              renderCitationCards(parsed.citations);
+            }
             if (parsed.type === 'token' && parsed.text) {
               live.textContent += parsed.text;
             }
