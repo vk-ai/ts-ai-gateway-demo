@@ -79,18 +79,23 @@ Response shape:
 
 ### `POST /chat/stream` (SSE)
 
-Same JSON body as `/chat`. Responds with `text/event-stream` frames:
+Same JSON body as `/chat`. Responds with `text/event-stream` frames. **Citations arrive early** (before token deltas) so the static UI can render source cards first — the citations-first pattern learners hit with Azure OpenAI / rag-chat-ui style clients:
 
 ```text
 event: meta
 data: {"type":"meta","provider":"mock","model":"mock-v1","retrievedCount":3}
 
+event: citations
+data: {"type":"citations","citations":[{"index":1,"id":"shipping-policy.md#0","source":"shipping-policy.md","text":"…","score":0.42}]}
+
 event: token
 data: {"type":"token","text":"Based on "}
 
 event: done
-data: {"type":"done","answer":"…","metrics":{…},…}
+data: {"type":"done","answer":"…","citations":[…],"metrics":{…},…}
 ```
+
+`public/index.html` renders **citation cards** as soon as the `citations` event arrives (before tokens append to the live pane).
 
 Teaching note: the mock (and optional OpenAI) path still **completes first**, then chunks the answer for SSE framing practice — this is **not** true token-by-token provider streaming. Existing `POST /chat` is unchanged.
 

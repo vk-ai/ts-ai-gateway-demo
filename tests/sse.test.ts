@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { handleChatStream } from '../src/chat.js';
+import { handleChatStream, toCitationCards } from '../src/chat.js';
 import { createGatewayServer } from '../src/index.js';
 import { MockProvider } from '../src/providers/mock.js';
 import { loadCorpus } from '../src/rag/corpus.js';
@@ -23,8 +23,21 @@ describe('SSE framing helpers', () => {
   });
 });
 
+describe('toCitationCards', () => {
+  it('maps retrieved chunks to 1-based citation cards', () => {
+    const cards = toCitationCards([
+      { id: 'a#0', source: 'a.md', text: 'hello', score: 0.9 },
+      { id: 'b#0', source: 'b.md', text: 'world', score: 0.5 },
+    ]);
+    expect(cards).toEqual([
+      { index: 1, id: 'a#0', source: 'a.md', text: 'hello', score: 0.9 },
+      { index: 2, id: 'b#0', source: 'b.md', text: 'world', score: 0.5 },
+    ]);
+  });
+});
+
 describe('handleChatStream events', () => {
-  it('yields meta → token+ → done', async () => {
+  it('yields meta → citations → token+ → done (citations before tokens)', async () => {
     const provider = new MockProvider();
     const corpus = await loadCorpus();
     const events = [];
@@ -37,18 +50,32 @@ describe('handleChatStream events', () => {
       events.push(evt);
     }
     expect(events[0]?.type).toBe('meta');
+    expect(events[1]?.type).toBe('citations');
+    const types = events.map((e) => e.type);
+    const citationsIdx = types.indexOf('citations');
+    const firstTokenIdx = types.indexOf('token');
+    expect(citationsIdx).toBeGreaterThanOrEqual(0);
+    expect(firstTokenIdx).toBeGreaterThan(citationsIdx);
     expect(events.at(-1)?.type).toBe('done');
+
+    const citationsEvt = events[1];
+    if (citationsEvt?.type !== 'citations') throw new Error('expected citations');
+    expect(citationsEvt.citations.length).toBeGreaterThan(0);
+    expect(citationsEvt.citations[0]?.index).toBe(1);
+    expect(citationsEvt.citations[0]?.source).toBeTruthy();
+
     const tokens = events.filter((e) => e.type === 'token');
     expect(tokens.length).toBeGreaterThan(0);
     const done = events.at(-1);
     if (done?.type !== 'done') throw new Error('expected done');
     const rejoined = tokens.map((t) => (t.type === 'token' ? t.text : '')).join('');
     expect(rejoined).toBe(done.answer);
+    expect(done.citations.length).toBe(citationsEvt.citations.length);
   });
 });
 
 describe('POST /chat/stream HTTP SSE', () => {
-  it('returns text/event-stream with event/data frames', async () => {
+  it('returns text/event-stream with citations before token frames', async () => {
     const provider = new MockProvider();
     const corpus = await loadCorpus();
     const server = createGatewayServer({ provider, corpus, topK: 3 });
@@ -70,9 +97,17 @@ describe('POST /chat/stream HTTP SSE', () => {
       expect(res.headers.get('content-type') ?? '').toMatch(/text\/event-stream/);
       const text = await res.text();
       expect(text).toContain('event: meta\n');
+      expect(text).toContain('event: citations\n');
       expect(text).toContain('event: token\n');
       expect(text).toContain('event: done\n');
+      expect(text).toMatch(/data: \{.*"type":"citations".*\}\n/);
       expect(text).toMatch(/data: \{.*"type":"token".*\}\n/);
+
+      const citePos = text.indexOf('event: citations\n');
+      const tokenPos = text.indexOf('event: token\n');
+      expect(citePos).toBeGreaterThan(-1);
+      expect(tokenPos).toBeGreaterThan(citePos);
+
       // Existing JSON /chat still works alongside stream.
       const chatRes = await fetch(`http://127.0.0.1:${port}/chat`, {
         method: 'POST',
@@ -89,4 +124,3 @@ describe('POST /chat/stream HTTP SSE', () => {
     }
   });
 });
-
