@@ -13,7 +13,9 @@
     .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.75rem; }
     button { padding: 0.55rem 1rem; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; font-weight: 600; }
     button.secondary { background: #0f766e; }
+    button.danger { background: #b91c1c; }
     button:disabled { opacity: 0.6; cursor: wait; }
+    #ttftBadge { font-variant-numeric: tabular-nums; color: #0f766e; font-weight: 600; margin-left: 0.5rem; }
     pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; white-space: pre-wrap; }
     .meta { color: #64748b; font-size: 0.85rem; margin-bottom: 1rem; }
     #streamLive { min-height: 3rem; border: 1px dashed #94a3b8; border-radius: 8px; padding: 0.75rem; background: white; margin-bottom: 0.75rem; }
@@ -35,7 +37,7 @@
 </head>
 <body>
   <h1>ts-ai-gateway-demo</h1>
-  <p class="meta">Minimal UI → <code>POST /chat</code> or streaming <code>POST /chat/stream</code> (SSE). Default provider is offline <strong>mock</strong>. Citations arrive as an early SSE event before tokens.</p>
+  <p class="meta">Minimal UI → <code>POST /chat</code> or streaming <code>POST /chat/stream</code> (SSE). Default provider is offline <strong>mock</strong>. Citations arrive as an early SSE event before tokens. Client TTFT + Stop (AbortController) on the stream path.</p>
   <div class="banner">
     <strong>OSS / learning portfolio demo only.</strong>
     Not employer production software. Does not claim any employer production experience.
@@ -45,6 +47,8 @@
   <div class="row">
     <button id="go" type="button">Ask (JSON)</button>
     <button id="goStream" class="secondary" type="button">Ask (SSE stream)</button>
+    <button id="stopStream" class="danger" type="button" disabled>Stop</button>
+    <span id="ttftBadge" title="Client TTFT: fetch start → first token text">TTFT: —</span>
   </div>
   <h2>Citations</h2>
   <div id="citations" class="cite-empty">(none yet — run SSE stream)</div>
@@ -122,12 +126,17 @@
       }
     });
 
+    const btnStop = document.getElementById('stopStream');
+    const ttftBadge = document.getElementById('ttftBadge');
+    let activeAbort = null;
+
     /** Tiny fetch-based SSE consumer (POST bodies aren't supported by EventSource). */
-    async function consumeSse(url, body, onEvent) {
+    async function consumeSse(url, body, onEvent, signal) {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify(body),
+        signal,
       });
       if (!res.ok || !res.body) throw new Error('stream HTTP ' + res.status);
       const reader = res.body.getReader();
@@ -152,13 +161,23 @@
       }
     }
 
+    btnStop.addEventListener('click', () => {
+      if (activeAbort) activeAbort.abort();
+    });
+
     btnStream.addEventListener('click', async () => {
       btnStream.disabled = true;
+      btnStop.disabled = false;
       live.textContent = '';
+      ttftBadge.textContent = 'TTFT: …';
       citesEl.className = 'cite-empty';
       citesEl.textContent = 'Waiting for citations event…';
       out.textContent = 'Streaming…';
       const events = [];
+      const ac = new AbortController();
+      activeAbort = ac;
+      const t0 = performance.now();
+      let ttftMs = null;
       try {
         await consumeSse('/chat/stream', { message: q.value }, (event, data) => {
           events.push({ event, data });
@@ -166,18 +185,38 @@
             const parsed = JSON.parse(data);
             if (parsed.type === 'citations' && Array.isArray(parsed.citations)) {
               // Citations-first: render cards as soon as the early SSE event arrives.
+              // Citations do NOT count as TTFT — first token text does.
               renderCitationCards(parsed.citations);
             }
             if (parsed.type === 'token' && parsed.text) {
+              if (ttftMs == null) {
+                ttftMs = Math.max(0, performance.now() - t0);
+                ttftBadge.textContent = 'TTFT: ' + ttftMs.toFixed(1) + ' ms';
+              }
               live.textContent += parsed.text;
             }
           } catch (_) { /* ignore non-JSON comment frames */ }
-        });
-        out.textContent = JSON.stringify(events, null, 2);
+        }, ac.signal);
+        out.textContent = JSON.stringify({ ttft_ms: ttftMs, events }, null, 2);
+        if (ttftMs == null) ttftBadge.textContent = 'TTFT: (no token)';
       } catch (err) {
-        out.textContent = String(err);
+        const aborted = err && err.name === 'AbortError';
+        if (aborted) {
+          ttftBadge.textContent = (ttftMs != null ? 'TTFT: ' + ttftMs.toFixed(1) + ' ms' : 'TTFT: —') + ' (stopped)';
+          out.textContent = JSON.stringify({
+            aborted: true,
+            ttft_ms: ttftMs,
+            partial: live.textContent,
+            events,
+          }, null, 2);
+        } else {
+          out.textContent = String(err);
+          ttftBadge.textContent = 'TTFT: error';
+        }
       } finally {
+        activeAbort = null;
         btnStream.disabled = false;
+        btnStop.disabled = true;
       }
     });
   </script>
