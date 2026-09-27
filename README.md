@@ -127,6 +127,30 @@ npm run build
 
 All tests run **offline** with the mock provider. The workflow YAML lives under `ci/github-actions.yml` (mirrored for PATs that lack the `workflow` scope for `.github/workflows`).
 
+
+## Client TTFT + Stop (AbortController)
+
+Server streaming already exists; this teaches the **client** product lesson:
+
+- **TTFT badge** — `performance.now()` from fetch start → first `token` text
+  (citations-first SSE frames do **not** count as TTFT)
+- **Stop** — `AbortController` wired through `fetch` so the user can cancel mid-stream
+  and keep partial text
+
+Helpers live in `src/clientStream.ts` (vitest-covered); the static UI in
+`public/index.html` mirrors the same pattern.
+
+```bash
+npm test
+npm run dev
+# open the UI → Ask (SSE stream) → watch TTFT; hit Stop mid-stream
+```
+
+> **Honesty:** Static HTML teaching UI — not a production chat product. Mock still
+> completes-then-chunks (not true provider token streaming). Community refs:
+> [promptfoo TTFT](https://github.com/promptfoo/promptfoo/pull/5680),
+> [AI SDK stopping streams](https://ai-sdk.dev/docs/advanced/stopping-streams).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
