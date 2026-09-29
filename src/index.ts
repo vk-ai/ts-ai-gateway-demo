@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handleChat, handleChatStream } from './chat.js';
-import { createProvider, resolveProviderKind, type LlmProvider } from './providers/index.js';
+import { createProviderFromEnv, FallbackError, type LlmProvider } from './providers/index.js';
 import { loadCorpus, type CorpusChunk } from './rag/corpus.js';
 import { formatSseEvent } from './sse.js';
 
@@ -212,11 +212,18 @@ export function createGatewayServer(deps: GatewayDeps): Server {
             );
           }
         } catch (err) {
+          // Only reached before the first token (chain exhausted / fatal): nothing was
+          // streamed yet, so the client can safely retry the whole request.
           const msg = err instanceof Error ? err.message : String(err);
           res.write(
             formatSseEvent({
               event: 'error',
-              data: JSON.stringify({ type: 'error', error: msg }),
+              data: JSON.stringify({
+                type: 'error',
+                error: msg,
+                afterFirstToken: false,
+                ...(err instanceof FallbackError ? { reason: err.reason, attempts: err.attempts } : {}),
+              }),
             }),
           );
         }
@@ -240,6 +247,11 @@ export function createGatewayServer(deps: GatewayDeps): Server {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (!res.headersSent && err instanceof FallbackError) {
+        // Upstream chain gave up: 502 + every attempt so learners can see the retry trail.
+        sendJson(res, 502, { error: message, reason: err.reason, attempts: err.attempts });
+        return;
+      }
       console.error(err);
       if (!res.headersSent) {
         sendJson(res, 500, { error: message });
@@ -251,8 +263,7 @@ export function createGatewayServer(deps: GatewayDeps): Server {
 }
 
 async function main(): Promise<void> {
-  const kind = resolveProviderKind();
-  const provider = createProvider(kind);
+  const provider = createProviderFromEnv(process.env, (msg) => console.log(`[ts-ai-gateway-demo] ${msg}`));
   const corpus = await loadCorpus();
 
   console.log(

@@ -51,6 +51,8 @@ Copy `.env.example` to `.env` if you want local overrides (the server reads `pro
 | `LLM_PROVIDER`   | `mock`      | `mock` or `openai`                         |
 | `OPENAI_API_KEY` | _(empty)_   | Required only for `openai`                 |
 | `OPENAI_MODEL`   | `gpt-4o-mini` | Used when provider is openai             |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint |
+| `LLM_FALLBACKS`  | _(unset)_   | Ordered chain, e.g. `openai,mock` (see below) |
 | `RAG_TOP_K`      | `3`         | Chunks retrieved per query                 |
 
 Without an API key the gateway **always** stays on the mock provider — safe for CI and demos.
@@ -108,7 +110,7 @@ Liveness + provider/chunk counts.
 ```
 data/                 fixture corpus (md/txt)
 src/
-  providers/          LlmProvider + mock + openai
+  providers/          LlmProvider + mock + openai + fallback chain + flaky mock
   rag/                corpus load + cosine retrieve + metrics
   chat.ts             retrieve → prompt → complete
   clientStream.ts     browser SSE helpers (TTFT + AbortController)
@@ -130,6 +132,40 @@ npm run build
 
 All tests run **offline** with the mock provider. The workflow YAML lives under `ci/github-actions.yml` (mirrored for PATs that lack the `workflow` scope for `.github/workflows`).
 
+
+## Provider fallback chain + retry/backoff
+
+Set `LLM_FALLBACKS` to wrap providers in an ordered **`FallbackProvider`** (`src/providers/fallback.ts`). When it is unset, nothing changes.
+
+| Upstream result | Action |
+|---|---|
+| `429`, `408`, `5xx`, per-attempt timeout, network error | **retry** the same provider with jittered exponential backoff (`base·2^n`, capped, "equal jitter"). An upstream **`Retry-After`** (seconds or HTTP-date) is honoured exactly; if it is longer than `LLM_MAX_RETRY_AFTER_MS`, the chain skips to the next provider instead of waiting |
+| `401` / `403` / `404` | no retry → **next provider** (provider-specific config problem) |
+| `400` / `422` / other 4xx | **stop** (the request is bad; another provider would reject it too) |
+
+**Streams:** a fallback is allowed only **before the first token**. Each stream attempt must open *and* deliver its first token within `LLM_TIMEOUT_MS`. Only then does the gateway emit `meta` (naming the provider that actually serves) and `citations`. If the provider drops **after** tokens were sent, you get an SSE `error` frame with `"afterFirstToken": true` and the `partialAnswer`. The gateway never splices a second model's text onto the first model's partial answer.
+
+Responses gain a `routing` block with `servedBy` and `attempts[]` (provider, attempt, outcome, status, delayMs). If the whole chain fails, `/chat` returns **502** with the attempt trail.
+
+```bash
+# Deterministic demo: the flaky mock returns 429 (Retry-After: 1) then 503 twice, then the chain falls back to mock
+LLM_FALLBACKS=flaky,mock FLAKY_FAULTS=429:1,503,503 npm run dev
+curl -s -X POST localhost:3000/chat -H 'Content-Type: application/json' \
+  -d '{"message":"What is the return window?"}' | jq .routing
+
+# Mid-stream drop: 2 tokens, then an `error` frame (no fallback)
+LLM_FALLBACKS=flaky,mock FLAKY_FAULTS=drop@2 npm run dev
+curl -sN -X POST localhost:3000/chat/stream -H 'Content-Type: application/json' \
+  -d '{"message":"What is the return window?"}'
+```
+
+`FLAKY_FAULTS` tokens (consumed one per call, then every call succeeds): `429`, `429:<retry-after-sec>`, `500`/`503`/`401`/`400`…, `timeout`, `network`, `drop@N`. `OPENAI_BASE_URL` points the OpenAI provider at any OpenAI-compatible server, for example a local stub that injects faults. Other tuning variables: `LLM_MAX_RETRIES` (2), `LLM_TIMEOUT_MS` (15000), `LLM_BACKOFF_BASE_MS` (250), `LLM_BACKOFF_MAX_MS` (4000), `LLM_MAX_RETRY_AFTER_MS` (10000).
+
+```bash
+npx vitest run tests/fallback.test.ts
+```
+
+> **Honesty:** teaching wrapper with in-process state only. It is not LiteLLM / Portkey / Vercel AI Gateway, and has no circuit breaker shared across instances. Motivation: [vercel/ai#2636](https://github.com/vercel/ai/issues/2636) (retry strategies and fallbacks), [vercel/ai PR #15381](https://github.com/vercel/ai/pull/15381), and the LiteLLM streaming-fallback bugs [#22296](https://github.com/BerriAI/litellm/issues/22296) / [#28216](https://github.com/BerriAI/litellm/issues/28216).
 
 ## Client TTFT + Stop (AbortController)
 
