@@ -9,7 +9,7 @@ Small TypeScript/Node AI gateway that wires together:
 2. **Simple RAG** — bag-of-words + cosine similarity over a fixture markdown/txt corpus under `data/` (no vector DB)  
 3. A **minimal HTTP API** (`node:http`) — `POST /chat` / `POST /query` (JSON) plus **`POST /chat/stream` (SSE)** return answer + retrieved context + groundedness metric  
 4. **Offline eval tests** — groundedness / keyword overlap with Vitest (pass without any API keys)  
-5. A tiny static HTML page to hit the API  
+5. A tiny static HTML page **and** an optional React (Vite) client to hit the API  
 
 ## Quick start
 
@@ -111,10 +111,13 @@ src/
   providers/          LlmProvider + mock + openai
   rag/                corpus load + cosine retrieve + metrics
   chat.ts             retrieve → prompt → complete
-  index.ts            HTTP server + static UI
-public/index.html     optional tiny client
+  clientStream.ts     browser SSE helpers (TTFT + AbortController)
+  index.ts            HTTP server + static UI (+ /react/ assets)
+public/index.html     static teaching UI
+public/react/         built React client (gitignored — run client:build)
+client/               Vite + React + TypeScript teaching UI (optional deps)
 tests/                vitest groundedness / retrieval / provider
-ci/github-actions.yml (mirrored to `.github/workflows/ci.yml` for Actions) CI mirror (copy to .github/workflows if allowed)
+ci/github-actions.yml (mirrored to `.github/workflows/ci.yml` for Actions)
 ```
 
 ## Tests & CI
@@ -150,6 +153,47 @@ npm run dev
 > completes-then-chunks (not true provider token streaming). Community refs:
 > [promptfoo TTFT](https://github.com/promptfoo/promptfoo/pull/5680),
 > [AI SDK stopping streams](https://ai-sdk.dev/docs/advanced/stopping-streams).
+
+
+## React client (optional Vite UI)
+
+A tiny **React + Vite + TypeScript** teaching UI lives under `client/`. It mirrors the
+static page (JSON chat, SSE stream with citations-first cards, TTFT badge, Stop via
+AbortController) and **reuses** `src/clientStream.ts` via a Vite alias — React is
+**not** a root dependency.
+
+`public/react/` is **gitignored**. Build the client when you want `/react/` served by
+the gateway; if the build is missing, `GET /react/` returns a JSON 404 with a build hint
+while `GET /` (static HTML) still works.
+
+### Dev (gateway + Vite)
+
+```bash
+# terminal 1 — gateway on :3000
+npm install
+npm run dev
+
+# terminal 2 — Vite on :5173 (proxies /chat, /chat/stream, /query, /health → :3000)
+npm run client:dev
+# open http://localhost:5173/react/
+```
+
+### Production-ish (gateway serves built assets)
+
+```bash
+npm run client:build   # installs nothing at root; needs client/node_modules
+npm run build && npm start
+# open http://localhost:3000/react/
+```
+
+Or after a one-time `npm --prefix client install`, use the same `client:build` script.
+
+Root `npm test` / `npm run typecheck` / `npm run build` do **not** require
+`client/node_modules`. CI stays on root tests only; build the client locally (or add a
+CI job later) when you care about the React UI.
+
+> **Honesty:** Optional React teaching shell — not a production chat product. Same mock
+> completes-then-chunks SSE framing as the static UI.
 
 ## License
 

@@ -40,6 +40,77 @@ function sendText(res: ServerResponse, status: number, body: string, type: strin
   res.end(body);
 }
 
+const REACT_MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+  '.map': 'application/json; charset=utf-8',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+const API_ROUTES = [
+  'GET /',
+  'GET /react/',
+  'GET /health',
+  'POST /chat',
+  'POST /query',
+  'POST /chat/stream',
+];
+
+/** Serve built Vite assets under /react/ from public/react (404 gracefully if missing). */
+async function tryServeReactStatic(
+  res: ServerResponse,
+  publicDir: string,
+  pathname: string,
+): Promise<boolean> {
+  if (!pathname.startsWith('/react')) return false;
+  const reactRoot = path.join(publicDir, 'react');
+  let rel = pathname === '/react' || pathname === '/react/' ? 'index.html' : pathname.slice('/react/'.length);
+  // basic path traversal guard
+  if (rel.includes('..')) {
+    sendJson(res, 400, { error: 'Invalid path' });
+    return true;
+  }
+  const filePath = path.resolve(reactRoot, rel);
+  const rootResolved = path.resolve(reactRoot);
+  const rootWithSep = rootResolved.endsWith(path.sep) ? rootResolved : rootResolved + path.sep;
+  if (filePath !== rootResolved && !filePath.startsWith(rootWithSep)) {
+    sendJson(res, 400, { error: 'Invalid path' });
+    return true;
+  }
+  try {
+    const data = await readFile(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const type = REACT_MIME[ext] ?? 'application/octet-stream';
+    res.writeHead(200, {
+      'Content-Type': type,
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(data);
+    return true;
+  } catch (err) {
+    const code = err && typeof err === 'object' && 'code' in err ? String((err as { code: string }).code) : '';
+    if (code === 'ENOENT') {
+      sendJson(res, 404, {
+        error: 'React client not built',
+        hint: 'Run: npm run client:build  (requires client/ deps). Static UI remains at GET /',
+        routes: API_ROUTES,
+      });
+      return true;
+    }
+    throw err;
+  }
+}
+
+
 function writeSseHeaders(res: ServerResponse): void {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -82,7 +153,7 @@ export function createGatewayServer(deps: GatewayDeps): Server {
           provider: deps.provider.name,
           chunks: deps.corpus.length,
           demo: 'oss-learning-only',
-          routes: ['GET /', 'GET /health', 'POST /chat', 'POST /query', 'POST /chat/stream'],
+          routes: API_ROUTES,
         });
         return;
       }
@@ -159,9 +230,13 @@ export function createGatewayServer(deps: GatewayDeps): Server {
         return;
       }
 
+      if (req.method === 'GET' && (await tryServeReactStatic(res, publicDir, url.pathname))) {
+        return;
+      }
+
       sendJson(res, 404, {
         error: 'Not found',
-        routes: ['GET /', 'GET /health', 'POST /chat', 'POST /query', 'POST /chat/stream'],
+        routes: API_ROUTES,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

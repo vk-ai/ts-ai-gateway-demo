@@ -5,3 +5,6 @@ dist/
 .DS_Store
 coverage/
 .vitest/
+client/node_modules/
+# Built Vite React client (run: npm run client:build)
+public/react/
