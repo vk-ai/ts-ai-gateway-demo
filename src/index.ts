@@ -2,9 +2,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { handleChat, handleChatStream } from './chat.js';
+import { COMPLETION_MAX_TOKENS, estimatePromptTokens, handleChat, handleChatStream } from './chat.js';
 import { createProviderFromEnv, FallbackError, type LlmProvider } from './providers/index.js';
 import { loadCorpus, type CorpusChunk } from './rag/corpus.js';
+import { apiKeyFrom, createQuotasFromEnv, estimateTokens, type KeyQuotas, type Reservation } from './quota.js';
 import { formatSseEvent } from './sse.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -21,13 +22,25 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+const CORS_ALLOW_HEADERS = 'Content-Type, x-api-key, Authorization';
+const CORS_EXPOSE_HEADERS =
+  'Retry-After, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, ' +
+  'x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens';
+
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   const payload = JSON.stringify(body, null, 2);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
+    'Access-Control-Expose-Headers': CORS_EXPOSE_HEADERS,
+    ...extraHeaders,
   });
   res.end(payload);
 }
@@ -63,6 +76,7 @@ const API_ROUTES = [
   'POST /chat',
   'POST /query',
   'POST /chat/stream',
+  'GET /usage',
 ];
 
 /** Serve built Vite assets under /react/ from public/react (404 gracefully if missing). */
@@ -111,14 +125,16 @@ async function tryServeReactStatic(
 }
 
 
-function writeSseHeaders(res: ServerResponse): void {
+function writeSseHeaders(res: ServerResponse, extraHeaders: Record<string, string> = {}): void {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
+    'Access-Control-Expose-Headers': CORS_EXPOSE_HEADERS,
+    ...extraHeaders,
   });
 }
 
@@ -127,6 +143,44 @@ export interface GatewayDeps {
   corpus: CorpusChunk[];
   topK?: number;
   publicDir?: string;
+  /** Optional per-API-key rate limit + token budget (off when undefined). */
+  quotas?: KeyQuotas;
+}
+
+type QuotaGate =
+  | { ok: true; key: string; reservation?: Reservation; promptTokens: number; headers: Record<string, string> }
+  | { ok: false };
+
+/**
+ * Reserve quota for a chat request or answer 429/413 to the caller.
+ * Reservation = estimated prompt tokens + COMPLETION_MAX_TOKENS (worst case), settled later.
+ */
+function gateQuota(
+  deps: GatewayDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  message: string,
+  topK: number,
+): QuotaGate {
+  const key = apiKeyFrom(req.headers);
+  if (!deps.quotas) return { ok: true, key, promptTokens: 0, headers: {} };
+  const promptTokens = estimatePromptTokens(deps.corpus, { message, topK });
+  const r = deps.quotas.reserve(key, promptTokens + COMPLETION_MAX_TOKENS);
+  if (!r.ok) {
+    sendJson(
+      res,
+      r.status,
+      {
+        error: r.status === 429 ? 'rate_limited' : 'request_exceeds_budget',
+        reason: r.reason,
+        message: r.error,
+        ...(r.retryAfterMs !== undefined ? { retryAfterSec: Math.ceil(r.retryAfterMs / 1000) } : {}),
+      },
+      r.headers,
+    );
+    return { ok: false };
+  }
+  return { ok: true, key, reservation: r.reservation, promptTokens, headers: r.headers };
 }
 
 export function createGatewayServer(deps: GatewayDeps): Server {
@@ -140,7 +194,7 @@ export function createGatewayServer(deps: GatewayDeps): Server {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
       });
       res.end();
       return;
@@ -154,7 +208,19 @@ export function createGatewayServer(deps: GatewayDeps): Server {
           chunks: deps.corpus.length,
           demo: 'oss-learning-only',
           routes: API_ROUTES,
+          quotas: deps.quotas ? 'per-key' : 'off',
         });
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/usage') {
+        // Caller's own usage (keyed by x-api-key), never another key's.
+        const key = apiKeyFrom(req.headers);
+        if (!deps.quotas) {
+          sendJson(res, 200, { key, enabled: false, hint: 'Set KEY_RPM / KEY_TOKENS_PER_WINDOW' });
+          return;
+        }
+        sendJson(res, 200, { enabled: true, ...deps.quotas.usage(key) }, deps.quotas.headers(key));
         return;
       }
 
@@ -172,10 +238,21 @@ export function createGatewayServer(deps: GatewayDeps): Server {
           sendJson(res, 400, { error: 'Provide "message" or "query" string' });
           return;
         }
-        const result = await handleChat(deps.provider, deps.corpus, {
-          message,
-          topK: parsed.topK ?? topKDefault,
-        });
+        const topK = parsed.topK ?? topKDefault;
+        const gate = gateQuota(deps, req, res, message, topK);
+        if (!gate.ok) return;
+        let result: Awaited<ReturnType<typeof handleChat>>;
+        try {
+          result = await handleChat(deps.provider, deps.corpus, { message, topK });
+        } catch (err) {
+          if (gate.reservation) deps.quotas?.release(gate.reservation);
+          throw err;
+        }
+        if (gate.reservation && deps.quotas) {
+          deps.quotas.settle(gate.reservation, gate.promptTokens + estimateTokens(result.answer));
+          sendJson(res, 200, result, deps.quotas.headers(gate.key));
+          return;
+        }
         sendJson(res, 200, result);
         return;
       }
@@ -195,15 +272,18 @@ export function createGatewayServer(deps: GatewayDeps): Server {
           return;
         }
 
-        writeSseHeaders(res);
+        const topK = parsed.topK ?? topKDefault;
+        const gate = gateQuota(deps, req, res, message, topK);
+        if (!gate.ok) return; // 429/413 JSON before any SSE headers
+
+        writeSseHeaders(res, gate.headers);
         // Comment frame helps some proxies flush headers immediately.
         res.write(': connected\n\n');
 
+        let streamed = '';
         try {
-          for await (const evt of handleChatStream(deps.provider, deps.corpus, {
-            message,
-            topK: parsed.topK ?? topKDefault,
-          })) {
+          for await (const evt of handleChatStream(deps.provider, deps.corpus, { message, topK })) {
+            if (evt.type === 'token') streamed += evt.text;
             res.write(
               formatSseEvent({
                 event: evt.type,
@@ -212,6 +292,7 @@ export function createGatewayServer(deps: GatewayDeps): Server {
             );
           }
         } catch (err) {
+          if (gate.reservation) deps.quotas?.release(gate.reservation);
           // Only reached before the first token (chain exhausted / fatal): nothing was
           // streamed yet, so the client can safely retry the whole request.
           const msg = err instanceof Error ? err.message : String(err);
@@ -226,6 +307,10 @@ export function createGatewayServer(deps: GatewayDeps): Server {
               }),
             }),
           );
+        }
+        // Settle with what was actually streamed (no-op if already released).
+        if (gate.reservation) {
+          deps.quotas?.settle(gate.reservation, gate.promptTokens + estimateTokens(streamed));
         }
         res.end();
         return;
@@ -273,7 +358,10 @@ async function main(): Promise<void> {
     'OSS/learning portfolio demo — NOT employer production. Offline mock is the default.',
   );
 
-  const server = createGatewayServer({ provider, corpus, topK: TOP_K });
+  const quotas = createQuotasFromEnv(process.env);
+  if (quotas) console.log('[ts-ai-gateway-demo] per-key quotas ON (in-memory, single process)');
+
+  const server = createGatewayServer({ provider, corpus, topK: TOP_K, quotas });
   server.listen(PORT, () => {
     console.log(`Listening on http://localhost:${PORT}`);
   });

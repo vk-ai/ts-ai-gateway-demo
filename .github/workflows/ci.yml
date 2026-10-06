@@ -34,3 +34,14 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"message":"What is the return window?"}' | grep -q '"answer"'
           kill $PID
+      - name: Smoke per-key quota (429 + Retry-After)
+        run: |
+          PORT=3001 KEY_RPM=1 node dist/index.js &
+          PID=$!
+          sleep 1
+          body='{"message":"What is the return window?"}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3001/chat -H 'x-api-key: ci' -H 'Content-Type: application/json' -d "$body")" = 200
+          curl -s -D /tmp/h.txt -o /dev/null -X POST http://localhost:3001/chat -H 'x-api-key: ci' -H 'Content-Type: application/json' -d "$body"
+          head -1 /tmp/h.txt | grep -q ' 429'
+          grep -qi '^retry-after: 60' /tmp/h.txt
+          kill $PID

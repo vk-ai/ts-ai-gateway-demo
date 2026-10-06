@@ -54,6 +54,7 @@ Copy `.env.example` to `.env` if you want local overrides (the server reads `pro
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint |
 | `LLM_FALLBACKS`  | _(unset)_   | Ordered chain, e.g. `openai,mock` (see below) |
 | `RAG_TOP_K`      | `3`         | Chunks retrieved per query                 |
+| `KEY_RPM` / `KEY_TOKENS_PER_WINDOW` | _(unset = off)_ | Per-API-key rate limit + token budget (see below) |
 
 Without an API key the gateway **always** stays on the mock provider — safe for CI and demos.
 
@@ -101,6 +102,10 @@ data: {"type":"done","answer":"…","citations":[…],"metrics":{…},…}
 
 Teaching note: the mock (and optional OpenAI) path still **completes first**, then chunks the answer for SSE framing practice — this is **not** true token-by-token provider streaming. Existing `POST /chat` is unchanged.
 
+### `GET /usage`
+
+With quotas on, returns the calling key's (`x-api-key`) request and token usage. Otherwise it returns `{ "enabled": false }`.
+
 ### `GET /health`
 
 Liveness + provider/chunk counts.
@@ -113,6 +118,7 @@ src/
   providers/          LlmProvider + mock + openai + fallback chain + flaky mock
   rag/                corpus load + cosine retrieve + metrics
   chat.ts             retrieve → prompt → complete
+  quota.ts            per-API-key token buckets (RPM + token budget) → 429 / Retry-After
   clientStream.ts     browser SSE helpers (TTFT + AbortController)
   index.ts            HTTP server + static UI (+ /react/ assets)
 public/index.html     static teaching UI
@@ -166,6 +172,53 @@ npx vitest run tests/fallback.test.ts
 ```
 
 > **Honesty:** teaching wrapper with in-process state only. It is not LiteLLM / Portkey / Vercel AI Gateway, and has no circuit breaker shared across instances. Motivation: [vercel/ai#2636](https://github.com/vercel/ai/issues/2636) (retry strategies and fallbacks), [vercel/ai PR #15381](https://github.com/vercel/ai/pull/15381), and the LiteLLM streaming-fallback bugs [#22296](https://github.com/BerriAI/litellm/issues/22296) / [#28216](https://github.com/BerriAI/litellm/issues/28216).
+
+## Per-API-key rate limit + token budget (429 + Retry-After)
+
+The fallback chain handles *upstream* 429s. This is the *downstream* half: the gateway
+protects itself, and its provider bill, from any one caller. It is **off by default**. Turn it
+on with env vars:
+
+```bash
+KEY_RPM=5 KEY_TOKENS_PER_WINDOW=4000 npm run dev
+# optional: KEY_BURST=5  KEY_WINDOW_MS=60000  KEY_LIMITS='{"free-key":{"requestsPerMinute":1}}'
+```
+
+Callers identify themselves with `x-api-key` (or `Authorization: Bearer …`). Requests without a
+key share an `anonymous` bucket. Each key gets two in-memory **token buckets**:
+
+| Bucket | Capacity | Refill |
+|---|---|---|
+| requests | `KEY_BURST` (default `KEY_RPM`) | `KEY_RPM` per minute |
+| tokens | `KEY_TOKENS_PER_WINDOW` | the full budget per `KEY_WINDOW_MS` |
+
+1. **Reserve** before calling the provider: 1 request + estimated tokens (prompt incl.
+   retrieved context + `maxTokens` 512, at ≈4 chars/token).
+2. **Settle** after the answer: unused tokens are refunded. A failed provider call releases the
+   reservation, but the request still counts toward RPM.
+3. Over a limit → **429** with `Retry-After` (seconds, computed from the bucket deficit and refill
+   rate) and `x-ratelimit-*` headers. A request bigger than the whole budget → **413**, with no
+   `Retry-After`, because waiting can't help. `/chat/stream` answers 429 as JSON *before* any SSE frame.
+
+```bash
+for i in 1 2 3 4 5 6; do
+  curl -s -o /dev/null -w '%{http_code} retry-after=%header{retry-after}\n' -X POST localhost:3000/chat \
+    -H 'x-api-key: demo' -H 'Content-Type: application/json' -d '{"message":"What is the return window?"}'
+done
+# 200 … 200, then: 429 retry-after=12
+curl -s localhost:3000/usage -H 'x-api-key: demo'   # your own key's usage only
+```
+
+Successful responses also carry `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`,
+`x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens` and `x-ratelimit-reset-tokens`
+(CORS-exposed so browser clients can read them). Tests use an injected clock, so they never sleep.
+
+> **Honesty:** single-process teaching code with the same *shape* as gateway quotas. It is not
+> distributed (no Redis), not auth (keys are identifiers, not validated secrets), and not
+> billing-grade token counting. Motivation: [litellm#28750 project-scoped budget limits](https://github.com/BerriAI/litellm/issues/28750),
+> [litellm PR #34500 multi-window budget_limits](https://github.com/BerriAI/litellm/pull/34500),
+> [vercel/ai next-openai-upstash-rate-limits example](https://github.com/vercel/ai/tree/main/examples/next-openai-upstash-rate-limits),
+> [Arcjet AI budget control](https://docs.arcjet.com/sdk/next/ai-protection/budget-control/).
 
 ## Client TTFT + Stop (AbortController)
 
