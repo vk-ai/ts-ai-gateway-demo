@@ -5,7 +5,11 @@ import {
   retrieve,
   type RetrievedChunk,
 } from './rag/retrieve.js';
+import { estimateTokens } from './quota.js';
 import { chunkText } from './sse.js';
+
+/** maxTokens sent to the provider; also the completion share of a quota reservation. */
+export const COMPLETION_MAX_TOKENS = 512;
 
 export interface ChatRequest {
   message: string;
@@ -120,6 +124,15 @@ function prepareChat(corpus: CorpusChunk[], request: ChatRequest): PreparedChat 
   };
 }
 
+/**
+ * Estimated prompt tokens for a request (system preamble + retrieved context + user message,
+ * ~4 tokens of chat framing per message). Used to reserve quota before calling the provider.
+ */
+export function estimatePromptTokens(corpus: CorpusChunk[], request: ChatRequest): number {
+  const { messages } = prepareChat(corpus, request);
+  return messages.reduce((n, m) => n + estimateTokens(m.content) + 4, 0);
+}
+
 async function buildChat(
   provider: LlmProvider,
   corpus: CorpusChunk[],
@@ -130,7 +143,7 @@ async function buildChat(
   const result = await provider.complete({
     messages,
     temperature: 0.2,
-    maxTokens: 512,
+    maxTokens: COMPLETION_MAX_TOKENS,
   });
 
   const groundedness = groundednessScore(result.content, contextText);
@@ -205,7 +218,7 @@ async function* streamViaProvider(
   const { retrieved, contextText, messages } = prepareChat(corpus, request);
   // Errors here (before any token) propagate to the HTTP layer as an SSE `error` frame.
   const s = await provider.stream!(
-    { messages, temperature: 0.2, maxTokens: 512 },
+    { messages, temperature: 0.2, maxTokens: COMPLETION_MAX_TOKENS },
     { chunkSize: opts?.chunkSize ?? 12 },
   );
   const routing = (): RoutingInfo | undefined =>
